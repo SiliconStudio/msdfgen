@@ -5,213 +5,158 @@
 #include <queue>
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include FT_OUTLINE_H
 
 #ifdef _WIN32
-#pragma comment(lib, "freetype.lib")
+    #pragma comment(lib, "freetype.lib")
 #endif
 
 namespace msdfgen {
 
 #define REQUIRE(cond) { if (!(cond)) return false; }
 
-	class FreetypeHandle {
-		friend FreetypeHandle * initializeFreetype();
-		friend void deinitializeFreetype(FreetypeHandle *library);
-		friend FontHandle * loadFont(FreetypeHandle *library, const char *filename);
+class FreetypeHandle {
+    friend FreetypeHandle * initializeFreetype();
+    friend void deinitializeFreetype(FreetypeHandle *library);
+    friend FontHandle * loadFont(FreetypeHandle *library, const char *filename);
 
-		FT_Library library;
+    FT_Library library;
 
-	};
+};
 
-	class FontHandle {
-		friend FontHandle * loadFont(FreetypeHandle *library, const char *filename);
-		friend void destroyFont(FontHandle *font);
-		friend bool getFontScale(double &output, FontHandle *font);
-		friend bool getFontWhitespaceWidth(double &spaceAdvance, double &tabAdvance, FontHandle *font);
-		friend bool loadGlyph(Shape &output, FontHandle *font, int unicode, double *advance);
-		friend bool getKerning(double &output, FontHandle *font, int unicode1, int unicode2);
+class FontHandle {
+    friend FontHandle * loadFont(FreetypeHandle *library, const char *filename);
+    friend void destroyFont(FontHandle *font);
+    friend bool getFontScale(double &output, FontHandle *font);
+    friend bool getFontWhitespaceWidth(double &spaceAdvance, double &tabAdvance, FontHandle *font);
+    friend bool loadGlyph(Shape &output, FontHandle *font, int unicode, double *advance);
+    friend bool getKerning(double &output, FontHandle *font, int unicode1, int unicode2);
 
-		FT_Face face;
+    FT_Face face;
 
-	};
+};
 
-	FreetypeHandle * initializeFreetype() {
-		FreetypeHandle *handle = new FreetypeHandle;
-		FT_Error error = FT_Init_FreeType(&handle->library);
-		if (error) {
-			delete handle;
-			return NULL;
-		}
-		return handle;
-	}
+struct FtContext {
+    Point2 position;
+    Shape *shape;
+    Contour *contour;
+};
 
-	void deinitializeFreetype(FreetypeHandle *library) {
-		FT_Done_FreeType(library->library);
-		delete library;
-	}
+static Point2 ftPoint2(const FT_Vector &vector) {
+    return Point2(vector.x/64., vector.y/64.);
+}
 
-	FontHandle * loadFont(FreetypeHandle *library, const char *filename) {
-		if (!library)
-			return NULL;
-		FontHandle *handle = new FontHandle;
-		FT_Error error = FT_New_Face(library->library, filename, 0, &handle->face);
-		if (error) {
-			delete handle;
-			return NULL;
-		}
-		return handle;
-	}
+static int ftMoveTo(const FT_Vector *to, void *user) {
+    FtContext *context = reinterpret_cast<FtContext *>(user);
+    context->contour = &context->shape->addContour();
+    context->position = ftPoint2(*to);
+    return 0;
+}
 
-	void destroyFont(FontHandle *font) {
-		FT_Done_Face(font->face);
-		delete font;
-	}
+static int ftLineTo(const FT_Vector *to, void *user) {
+    FtContext *context = reinterpret_cast<FtContext *>(user);
+    context->contour->addEdge(new LinearSegment(context->position, ftPoint2(*to)));
+    context->position = ftPoint2(*to);
+    return 0;
+}
 
-	bool getFontScale(double &output, FontHandle *font) {
-		output = font->face->units_per_EM / 64.;
-		return true;
-	}
+static int ftConicTo(const FT_Vector *control, const FT_Vector *to, void *user) {
+    FtContext *context = reinterpret_cast<FtContext *>(user);
+    context->contour->addEdge(new QuadraticSegment(context->position, ftPoint2(*control), ftPoint2(*to)));
+    context->position = ftPoint2(*to);
+    return 0;
+}
 
-	bool getFontWhitespaceWidth(double &spaceAdvance, double &tabAdvance, FontHandle *font) {
-		FT_Error error = FT_Load_Char(font->face, ' ', FT_LOAD_NO_SCALE);
-		if (error)
-			return false;
-		spaceAdvance = font->face->glyph->advance.x / 64.;
-		error = FT_Load_Char(font->face, '\t', FT_LOAD_NO_SCALE);
-		if (error)
-			return false;
-		tabAdvance = font->face->glyph->advance.x / 64.;
-		return true;
-	}
+static int ftCubicTo(const FT_Vector *control1, const FT_Vector *control2, const FT_Vector *to, void *user) {
+    FtContext *context = reinterpret_cast<FtContext *>(user);
+    context->contour->addEdge(new CubicSegment(context->position, ftPoint2(*control1), ftPoint2(*control2), ftPoint2(*to)));
+    context->position = ftPoint2(*to);
+    return 0;
+}
 
-	bool loadGlyph(Shape &output, FontHandle *font, int unicode, double *advance) {
-		enum PointType {
-			NONE = 0,
-			PATH_POINT,
-			QUADRATIC_POINT,
-			CUBIC_POINT,
-			CUBIC_POINT2
-		};
+FreetypeHandle * initializeFreetype() {
+    FreetypeHandle *handle = new FreetypeHandle;
+    FT_Error error = FT_Init_FreeType(&handle->library);
+    if (error) {
+        delete handle;
+        return NULL;
+    }
+    return handle;
+}
 
-		if (!font)
-			return false;
-		FT_Error error = FT_Load_Char(font->face, unicode, FT_LOAD_NO_SCALE);
-		if (error)
-			return false;
-		output.contours.clear();
-		output.inverseYAxis = false;
-		if (advance)
-			*advance = font->face->glyph->advance.x / 64.;
+void deinitializeFreetype(FreetypeHandle *library) {
+    FT_Done_FreeType(library->library);
+    delete library;
+}
 
-		int last = -1;
-		// For each contour
-		for (int i = 0; i < font->face->glyph->outline.n_contours; ++i) {
+FontHandle * loadFont(FreetypeHandle *library, const char *filename) {
+    if (!library)
+        return NULL;
+    FontHandle *handle = new FontHandle;
+    FT_Error error = FT_New_Face(library->library, filename, 0, &handle->face);
+    if (error) {
+        delete handle;
+        return NULL;
+    }
+    return handle;
+}
 
-			Contour &contour = output.addContour();
-			int first = last + 1;
-			last = font->face->glyph->outline.contours[i];
+void destroyFont(FontHandle *font) {
+    FT_Done_Face(font->face);
+    delete font;
+}
 
-			PointType state = NONE;
-			Point2 startPoint;
-			Point2 controlPoint[2];
+bool getFontScale(double &output, FontHandle *font) {
+    output = font->face->units_per_EM/64.;
+    return true;
+}
 
-			// For each point on the contour
-			bool closeContour = false;
-			for (int round = 0, index = first; round == 0; ++index) {
-				// Close contour
-				if (index > last) {
-					index = first;
-					round++;
-					closeContour = true;
-				}
+bool getFontWhitespaceWidth(double &spaceAdvance, double &tabAdvance, FontHandle *font) {
+    FT_Error error = FT_Load_Char(font->face, ' ', FT_LOAD_NO_SCALE);
+    if (error)
+        return false;
+    spaceAdvance = font->face->glyph->advance.x/64.;
+    error = FT_Load_Char(font->face, '\t', FT_LOAD_NO_SCALE);
+    if (error)
+        return false;
+    tabAdvance = font->face->glyph->advance.x/64.;
+    return true;
+}
 
-				Point2 point(font->face->glyph->outline.points[index].x / 64., font->face->glyph->outline.points[index].y / 64.);
-				PointType pointType = font->face->glyph->outline.tags[index] & 1 ? PATH_POINT : font->face->glyph->outline.tags[index] & 2 ? CUBIC_POINT : QUADRATIC_POINT;
+bool loadGlyph(Shape &output, FontHandle *font, int unicode, double *advance) {
+    if (!font)
+        return false;
+    FT_Error error = FT_Load_Char(font->face, unicode, FT_LOAD_NO_SCALE);
+    if (error)
+        return false;
+    output.contours.clear();
+    output.inverseYAxis = false;
+    if (advance)
+        *advance = font->face->glyph->advance.x/64.;
 
-				switch (state) {
-				case NONE:
-					if (pointType == PATH_POINT) {
-						startPoint = point;
-						state = PATH_POINT;
-					}
-					else if (pointType == QUADRATIC_POINT)
-					{
-						//eg. Windows Tahoma unicode 197
-						startPoint = point;
-						controlPoint[0] = point;
-						state = QUADRATIC_POINT;
-					}
-					else {
-						//err?
-						return false;
-					}
-					break;
-				case PATH_POINT:
-					if (pointType == PATH_POINT) {
-						contour.addEdge(new LinearSegment(startPoint, point));
-						startPoint = point;
-					}
-					else {
-						if (closeContour) {
-							//close contour mode
-							contour.addEdge(new LinearSegment(startPoint, point));
-							startPoint = point;
-							closeContour = false;
-						}
-						else {
-							controlPoint[0] = point;
-							state = pointType;
-						}
-					}
-					break;
-				case QUADRATIC_POINT:
-					REQUIRE(pointType != CUBIC_POINT);
-					if (pointType == PATH_POINT) {
-						contour.addEdge(new QuadraticSegment(startPoint, controlPoint[0], point));
-						startPoint = point;
-						state = PATH_POINT;
-					}
-					else {
-						Point2 midPoint = .5*controlPoint[0] + .5*point;
-						contour.addEdge(new QuadraticSegment(startPoint, controlPoint[0], midPoint));
-						startPoint = midPoint;
-						controlPoint[0] = point;
-					}
-					break;
-				case CUBIC_POINT:
-					REQUIRE(pointType == CUBIC_POINT);
-					controlPoint[1] = point;
-					state = CUBIC_POINT2;
-					break;
-				case CUBIC_POINT2:
-					REQUIRE(pointType != QUADRATIC_POINT);
-					if (pointType == PATH_POINT) {
-						contour.addEdge(new CubicSegment(startPoint, controlPoint[0], controlPoint[1], point));
-						startPoint = point;
-					}
-					else {
-						Point2 midPoint = .5*controlPoint[1] + .5*point;
-						contour.addEdge(new CubicSegment(startPoint, controlPoint[0], controlPoint[1], midPoint));
-						startPoint = midPoint;
-						controlPoint[0] = point;
-					}
-					state = pointType;
-					break;
-				}
+    FtContext context = { };
+    context.shape = &output;
+    FT_Outline_Funcs ftFunctions;
+    ftFunctions.move_to = &ftMoveTo;
+    ftFunctions.line_to = &ftLineTo;
+    ftFunctions.conic_to = &ftConicTo;
+    ftFunctions.cubic_to = &ftCubicTo;
+    ftFunctions.shift = 0;
+    ftFunctions.delta = 0;
+    error = FT_Outline_Decompose(&font->face->glyph->outline, &ftFunctions, &context);
+    if (error)
+        return false;
+    return true;
+}
 
-			}
-		}
-		return true;
-	}
-
-	bool getKerning(double &output, FontHandle *font, int unicode1, int unicode2) {
-		FT_Vector kerning;
-		if (FT_Get_Kerning(font->face, FT_Get_Char_Index(font->face, unicode1), FT_Get_Char_Index(font->face, unicode2), FT_KERNING_UNSCALED, &kerning)) {
-			output = 0;
-			return false;
-		}
-		output = kerning.x / 64.;
-		return true;
-	}
+bool getKerning(double &output, FontHandle *font, int unicode1, int unicode2) {
+    FT_Vector kerning;
+    if (FT_Get_Kerning(font->face, FT_Get_Char_Index(font->face, unicode1), FT_Get_Char_Index(font->face, unicode2), FT_KERNING_UNSCALED, &kerning)) {
+        output = 0;
+        return false;
+    }
+    output = kerning.x/64.;
+    return true;
+}
 
 }
